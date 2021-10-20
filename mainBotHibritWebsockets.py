@@ -1,7 +1,11 @@
 import os
 from binance import Client
+from binance import BinanceSocketManager
 import pandas as pd
 import time
+import asyncio
+import websockets
+import json
 
 # Pandas allow full table view
 from binance.exceptions import BinanceOrderException, BinanceAPIException
@@ -16,6 +20,22 @@ api_secret = os.environ.get('binance_secret')
 
 # create client binance connection
 client = Client(api_key, api_secret)
+bsm = BinanceSocketManager(client)
+
+
+def createframe(msg):
+    df = pd.DataFrame([msg])
+    df = df.loc[:, ['s', 'E', 'p']]
+    df.columns = ['symbol', 'Time', 'Price']
+    df.Price = df.Price.astype(float)
+    df.Time = pd.to_datetime(df.Time, unit='ms')
+    return df
+
+
+socket = f'wss://stream.binance.com:9443/stream?streams=!ticker@arr'
+
+stream = websockets.connect(socket)
+
 
 # Pulling data from binance - Top price change percent last 24hours
 def get_top_symbol():
@@ -41,17 +61,20 @@ def getminutedata(symbol, interval, lookback):
     return frame
 
 
-def strategy(buy_usdt, SL=0.985, TP=1.02, open_position=False):
+async def strategy(buy_usdt, SL=0.985, TP=1.02, open_position=False):
     try:
         asset = get_top_symbol()
-        df = getminutedata(asset, '1m', '120')
-    except:  # handle timeout exceptions
+    except:
         time.sleep(61)
         asset = get_top_symbol()
-        df = getminutedata(asset, '1m', '120')
 
-    qty = round(buy_usdt / df.Close.iloc[-1], 2)
-    print(df.Close)
+    df = getminutedata(asset, '1m', '120')
+
+    qty = round(buy_usdt / df.Close.iloc[-1])
+
+    print(qty)
+    # pct_change = Percentage change between the current and a prior element
+    # cumprod = Return the cumulative product of elements along a given axis
     if ((df.Close.pct_change() + 1).cumprod()).iloc[-1] > 1:
         try:
             order = client.create_order(symbol=asset,
@@ -70,17 +93,14 @@ def strategy(buy_usdt, SL=0.985, TP=1.02, open_position=False):
             print(e)
 
         while open_position:
-            try:
-                df = getminutedata(asset, '1m', '2')
-            except:
-                print('Something wrong. Waiting 1 minute.')
-                time.sleep(61)
-                df = getminutedata(asset, '1m', '2')
-
-            print(f'Current Close is ' + str(df.Close[-1]))
+            socket = bsm.trade_socket(asset)
+            await socket.__aenter__()
+            msg = await socket.recv()
+            df = createframe(msg)
+            print(f'Current Close is ' + str(df.Price.values))
             print(f'Current TP is ' + str(buyprice * TP))
             print(f'Current SL is ' + str(buyprice * SL))
-            if df.Close[-1] <= buyprice * SL or df.Close[-1] >= buyprice * TP:
+            if df.Price.values <= buyprice * SL or df.Price.values >= buyprice * TP:
                 order = client.create_order(symbol=asset,
                                             side='SELL',
                                             type='MARKET',
@@ -89,5 +109,11 @@ def strategy(buy_usdt, SL=0.985, TP=1.02, open_position=False):
                 break
 
 
-while True:
-    strategy(10)
+async def main():
+    while True:
+        await strategy(15)
+
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
